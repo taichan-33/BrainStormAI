@@ -1,67 +1,50 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
-// Types
-interface ChatMessage {
-  id: string;
-  session_id: string;
-  agent_id: string;
-  content: string;
-  timestamp: string;
-  step: number;
-}
+import { SessionStatus } from './types';
 
-interface SessionStatus {
-  session_id: string;
-  status: string;
-  messages: ChatMessage[];
-  next_turn_agent_id: string | null;
-  is_finished: boolean;
-  summary?: string;
-  custom_agents?: CustomAgent[];
-}
+import { DEFAULT_AGENTS, CustomAgent, CUSTOM_COLORS } from './constants/agents';
+import { useAgents } from './hooks/useAgents';
+import { useBrainstorming } from './hooks/useBrainstorming';
+import { sessionService } from './services/sessions';
 
-interface CustomAgent {
-  id?: string;  // 永続化エージェントの場合はUUID
-  name: string;
-  role: string;
-  responsibility: string;
-  personality: string;
-  model: string;
-}
 
-const DEFAULT_AGENTS: Record<string, { role: string; color: string; bg: string; icon: string }> = {
-  "01": { role: "司会 (Facilitator)", color: "text-blue-600", bg: "bg-blue-50 border-blue-200", icon: "🎙️" },
-  "02": { role: "起業家 (Innovator)", color: "text-yellow-600", bg: "bg-yellow-50 border-yellow-200", icon: "🚀" },
-  "03": { role: "批評家 (Critic)", color: "text-red-600", bg: "bg-red-50 border-red-200", icon: "🧐" },
-  "04": { role: "戦略家 (Strategist)", color: "text-purple-600", bg: "bg-purple-50 border-purple-200", icon: "🔧" },
-  "05": { role: "マーケター (Marketer)", color: "text-pink-600", bg: "bg-pink-50 border-pink-200", icon: "📣" },
-  "06": { role: "技術者 (Tech Lead)", color: "text-emerald-600", bg: "bg-emerald-50 border-emerald-200", icon: "🔧" },
-};
-
-const CUSTOM_COLORS = [
-  { color: "text-cyan-600", bg: "bg-cyan-50 border-cyan-200", icon: "🤖" },
-  { color: "text-orange-600", bg: "bg-orange-50 border-orange-200", icon: "🧩" },
-  { color: "text-teal-600", bg: "bg-teal-50 border-teal-200", icon: "💡" },
-];
 
 import HistorySidebar from './components/HistorySidebar';
 import AgentSettingsModal from './components/AgentSettingsModal';
+import TimelineView from './components/TimelineView';
+import VoiceInput from './components/VoiceInput';
+import TTSPlayer from './components/TTSPlayer';
+import RelationshipModal from './components/RelationshipModal';
 
 export default function Home() {
   const [topic, setTopic] = useState('');
   const [context, setContext] = useState('');
   const [turnCount, setTurnCount] = useState(6); // Default 1 round
-  const [session, setSession] = useState<SessionStatus | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [progress, setProgress] = useState('');
-  const [error, setError] = useState('');
+
+  const {
+    session,
+    setSession,
+    loading,
+    progress,
+    error,
+    startSession,
+    resumeSession,
+    setError
+  } = useBrainstorming();
   
   // Custom agents state
-  const [customAgents, setCustomAgents] = useState<CustomAgent[]>([]);
+  const { 
+    customAgents, 
+    setCustomAgents, 
+    addCustomAgent: addAgent, 
+    removeCustomAgent, 
+    relationshipAgents 
+  } = useAgents();
+
   const [showAgentForm, setShowAgentForm] = useState(false);
   const [newAgent, setNewAgent] = useState<CustomAgent>({
     name: '',
@@ -74,6 +57,14 @@ export default function Home() {
   // Agent settings modal state
   const [showAgentSettings, setShowAgentSettings] = useState(false);
   const [enabledAgentIds, setEnabledAgentIds] = useState<string[]>(['01', '02', '03', '04', '05', '06']);
+  
+  // 表示モード切り替え（カード or タイムライン）
+  const [viewMode, setViewMode] = useState<'card' | 'timeline'>('card');
+  
+  // 関係性モーダル
+  const [showRelationshipModal, setShowRelationshipModal] = useState(false);
+
+
 
   // Dynamic AGENTS map
   const getAgentsMap = () => {
@@ -110,141 +101,53 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [session?.messages]);
 
-  const loadSession = async (sessionId: string) => {
-      setLoading(true);
-      setError('');
-      try {
-          const res = await fetch(`/api/sessions/${sessionId}`);
-          if (!res.ok) throw new Error('セッションの読み込みに失敗しました');
-          const data = await res.json();
-          setSession(data);
-          // If loaded topic is available? Schema update required to pass topic back, but for now we view messages.
-      } catch (e: any) {
-          setError(e.message);
-      } finally {
-          setLoading(false);
-      }
-  };
-
   const handleNewSession = () => {
       setSession(null);
       setTopic('');
       setContext('');
-      setCustomAgents([]);
+      // customAgents clear logic if needed, but maybe keep them?
+      // setCustomAgents([]); // Optional: keep agents across sessions
+  };
+
+  const loadSession = async (sessionId: string) => {
+      try {
+          const data = await sessionService.get(sessionId);
+          setSession(data);
+      } catch (e: any) {
+          setError(e.message);
+      }
   };
 
   const addCustomAgent = () => {
     if (!newAgent.name || !newAgent.role) return;
     if (customAgents.length >= 3) return;
-    setCustomAgents([...customAgents, { ...newAgent }]);
+    
+    // フックの関数を使用
+    addAgent(newAgent);
+    
     setNewAgent({ name: '', role: '', responsibility: '', personality: '', model: 'gpt-5.2' });
     setShowAgentForm(false);
   };
 
-  const removeCustomAgent = (index: number) => {
-    setCustomAgents(customAgents.filter((_, i) => i !== index));
-  };
 
-  const runSession = async () => {
+
+  const handleRunSession = () => {
     if (!topic) return;
-    setLoading(true);
-    setError('');
-    setProgress('セッションを開始中...');
-    
-    try {
-      // 1. Create Session
-      const initRes = await fetch('/api/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          topic, 
-          context_details: context,
-          custom_agents: customAgents.length > 0 ? customAgents : undefined,
-          enabled_agent_ids: enabledAgentIds,
-        }),
-      });
-      if (!initRes.ok) throw new Error('会議の開始に失敗しました');
-      let currentSession: SessionStatus = await initRes.json();
-      setSession(currentSession);
-
-      // 2. Auto Loop
-      for (let i = 0; i < turnCount; i++) {
-        setProgress(`議論進行中... (${i + 1}/${turnCount} ターン目)`);
-        
-        // Wait a bit for UX
-        await new Promise(r => setTimeout(r, 800));
-
-        const turnRes = await fetch(`/api/sessions/${currentSession.session_id}/next-turn`, {
-          method: 'POST',
-        });
-        if (!turnRes.ok) throw new Error(`ターン ${i+1} でエラーが発生しました`);
-        currentSession = await turnRes.json();
-        setSession(currentSession);
-        
-        if (currentSession.status === 'completed') break;
-      }
-
-      // 3. Summarize
-      setProgress('議論を要約中...');
-      const summaryRes = await fetch(`/api/sessions/${currentSession.session_id}/summary`, {
-          method: 'POST',
-      });
-      if(summaryRes.ok) {
-          currentSession = await summaryRes.json();
-          setSession(currentSession);
-      }
-
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-      setProgress('');
-    }
+    startSession({
+        topic,
+        context_details: context,
+        custom_agents: customAgents.length > 0 ? customAgents : undefined,
+        enabled_agent_ids: enabledAgentIds,
+    }, turnCount);
   };
-  
-  const runResume = async () => {
+
+  const handleResumeSession = () => {
     if (!session) return;
     if (turnCount <= 0) {
       setError('ターン数を1以上に設定してください');
       return;
     }
-    setLoading(true);
-    setError('');
-    
-    try {
-        let currentSession = session;
-        // Resume Loop
-        for (let i = 0; i < turnCount; i++) {
-            setProgress(`議論再開中... (${i + 1}/${turnCount} ターン目)`);
-            
-            await new Promise(r => setTimeout(r, 800));
-
-            const turnRes = await fetch(`/api/sessions/${currentSession.session_id}/next-turn`, {
-                method: 'POST',
-            });
-            if (!turnRes.ok) throw new Error(`ターン ${i+1} でエラーが発生しました`);
-            currentSession = await turnRes.json();
-            setSession({...currentSession});  // 新しいオブジェクトを作成して確実に再レンダリング
-            
-            if (currentSession.status === 'completed') break;
-        }
-
-        // Re-summarize after resume? Optional, but good to have updated summary.
-        setProgress('議論を要約中(更新)...');
-        const summaryRes = await fetch(`/api/sessions/${currentSession.session_id}/summary`, {
-            method: 'POST',
-        });
-        if(summaryRes.ok) {
-            currentSession = await summaryRes.json();
-            setSession({...currentSession});  // 新しいオブジェクトを作成
-        }
-
-    } catch (err: any) {
-        setError(err.message);
-    } finally {
-        setLoading(false);
-        setProgress('');
-    }
+    resumeSession(turnCount);
   };
 
   const exportSummary = () => {
@@ -260,6 +163,8 @@ export default function Home() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
 
   const toggleSidebar = () => setIsSidebarOpen(!isSidebarOpen);
+
+  // useMemoロジックはフックに移動したため削除
 
   return (
     <div className="flex min-h-screen bg-slate-50 font-sans text-slate-800">
@@ -282,7 +187,13 @@ export default function Home() {
         customAgents={customAgents}
         setCustomAgents={setCustomAgents}
       />
-
+      
+      {/* Relationship Modal */}
+      <RelationshipModal
+        isOpen={showRelationshipModal}
+        onClose={() => setShowRelationshipModal(false)}
+        agents={relationshipAgents}
+      />
       <main className="flex-1 flex flex-col h-screen overflow-hidden relative transition-all duration-300">
       <header className="bg-white/80 backdrop-blur-md sticky top-0 z-10 border-b border-slate-200 shadow-sm flex-shrink-0">
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
@@ -311,6 +222,12 @@ export default function Home() {
           </div>
           {session && (
             <div className="flex items-center gap-4">
+               <button
+                 onClick={() => setShowRelationshipModal(true)}
+                 className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white text-xs font-bold rounded-full hover:bg-purple-700 transition-colors shadow-lg shadow-purple-500/30"
+               >
+                   🔗 関係性設定
+               </button>
                {session.summary && (
                    <button 
                     onClick={exportSummary}
@@ -348,6 +265,9 @@ export default function Home() {
                     value={topic}
                     onChange={(e) => setTopic(e.target.value)}
                   />
+                  <div className="mt-2">
+                    <VoiceInput onTranscript={(text) => setTopic(prev => prev ? `${prev} ${text}` : text)} />
+                  </div>
                 </div>
                 
                 <div>
@@ -361,6 +281,9 @@ export default function Home() {
                     value={context}
                     onChange={(e) => setContext(e.target.value)}
                   />
+                  <div className="mt-2">
+                    <VoiceInput onTranscript={(text) => setContext(prev => prev ? `${prev} ${text}` : text)} />
+                  </div>
                 </div>
 
                 <div>
@@ -514,7 +437,7 @@ export default function Home() {
                 </div>
                 <div className="pt-2">
                   <button
-                    onClick={runSession}
+                    onClick={handleRunSession}
                     disabled={loading || !topic}
                     className="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 text-white font-bold py-4 rounded-xl shadow-lg shadow-indigo-500/30 transition-all transform active:scale-[0.98] disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                   >
@@ -545,14 +468,55 @@ export default function Home() {
                  {/*  Ideally we show stored topic, but currently SessionStatus schema doesn't have topic. using local state if new, generic if loaded. */}
                  <h2 className="text-2xl font-bold text-slate-800">{topic || '過去のセッションログ'}</h2>
                  {context && <p className="text-slate-500 mt-2 text-sm max-w-2xl mx-auto">{context}</p>}
+                 
+                 {/* 表示モード切替ボタン */}
+                 <div className="flex justify-center gap-2 mt-4">
+                   <button
+                     onClick={() => setViewMode('card')}
+                     className={`px-4 py-2 rounded-lg text-sm font-bold transition-all ${
+                       viewMode === 'card'
+                         ? 'bg-indigo-600 text-white shadow-md'
+                         : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                     }`}
+                   >
+                     📋 カード表示
+                   </button>
+                   <button
+                     onClick={() => setViewMode('timeline')}
+                     className={`px-4 py-2 rounded-lg text-sm font-bold transition-all ${
+                       viewMode === 'timeline'
+                         ? 'bg-indigo-600 text-white shadow-md'
+                         : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                     }`}
+                   >
+                     📊 タイムライン
+                   </button>
+                   <button
+                     onClick={() => window.open(`/api/sessions/${session.session_id}/export/pdf`, '_blank')}
+                     className="px-4 py-2 rounded-lg text-sm font-bold bg-red-500 text-white hover:bg-red-600 transition-all shadow-md"
+                   >
+                     📄 PDF出力
+                   </button>
+                 </div>
+                 
+                 {/* 音声読み上げ */}
+                 <div className="mt-4">
+                   <TTSPlayer messages={session.messages} agents={getAgentsMap()} />
+                 </div>
                </div>
 
-              {session.messages.map((msg, idx) => {
-                const AGENTS = getAgentsMap();
-                const agent = AGENTS[msg.agent_id] || { role: "不明", color: "text-gray-600", bg: "bg-white", icon: "👤" };
-                const isSystem = msg.agent_id === '01'; 
+              {/* タイムライン表示 */}
+              {viewMode === 'timeline' ? (
+                <TimelineView messages={session.messages} agents={getAgentsMap()} />
+              ) : (
+                <>
+                  {/* カード表示（既存） */}
+                  {session.messages.map((msg, idx) => {
+                    const AGENTS = getAgentsMap();
+                    const agent = AGENTS[msg.agent_id] || { role: "不明", color: "text-gray-600", bg: "bg-white", icon: "👤" };
+                    const isSystem = msg.agent_id === '01'; 
                 
-                return (
+                    return (
                   <div key={msg.id} className={`flex w-full mb-8 group ${isSystem ? 'justify-center' : ''} animate-in fade-in slide-in-from-bottom-4 duration-500 fill-mode-backwards`} style={{ animationDelay: `${idx * 0.1}s` }}>
                     <div className={`relative w-full max-w-4xl p-8 rounded-2xl shadow-md border-2 ${agent.bg} ${isSystem ? 'text-center border-blue-300 bg-gradient-to-br from-blue-50 to-white' : 'bg-white border-slate-200 hover:shadow-lg transition-shadow'}`}>
                       <div className={`flex items-center gap-4 mb-5 pb-4 border-b border-slate-100 ${isSystem ? 'justify-center flex-col border-blue-100' : ''}`}>
@@ -634,8 +598,9 @@ export default function Home() {
                     </div>
                   </div>
                 );
-              })}
-              
+                  })}
+                </>
+              )}
               {/* Summary Section */}
               {session.summary && (
                   <div className="mt-8 bg-indigo-50 border-2 border-indigo-100 rounded-3xl p-8 relative overflow-hidden">
@@ -743,7 +708,7 @@ export default function Home() {
                             </div>
                         </div>
                         <button 
-                            onClick={runResume} 
+                            onClick={handleResumeSession} 
                             disabled={loading}
                             className="bg-white border-2 border-indigo-600 text-indigo-600 px-8 py-3 rounded-full font-bold hover:bg-indigo-50 transition-colors shadow-sm disabled:opacity-50"
                         >

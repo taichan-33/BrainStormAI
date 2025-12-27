@@ -7,63 +7,26 @@ from app.core.constants import AGENT_DEFINITIONS
 
 from sqlalchemy.orm import Session
 from app.models.session import DbSession, DbMessage
+from app.services.agent_registry import AgentRegistry
+from app.services.prompt_builder import PromptBuilder
 
 
 class Orchestrator:
+    def __init__(self):
+        self.agent_registry = AgentRegistry()
+        self.prompt_builder = PromptBuilder()
+
     def _get_all_agents(self, db_session: DbSession) -> List[dict]:
-        """デフォルトエージェントとカスタムエージェントを結合して返す"""
-        agents = list(AGENT_DEFINITIONS)
-
-        if db_session.custom_agents:
-            for idx, custom in enumerate(db_session.custom_agents):
-                # 永続化エージェントの場合はIDを保持、一時的な場合はC01形式
-                agent_id = custom.get("id", f"C{idx + 1:02d}")
-                agents.append(
-                    {
-                        "id": agent_id,
-                        "name": custom.get("name", f"Custom Agent {idx + 1}"),
-                        "role": custom.get("role", "カスタム"),
-                        "model": custom.get("model", "gpt-5.2"),
-                        "responsibility": custom.get("responsibility", ""),
-                        "personality_key": custom.get("personality", ""),
-                        "provider": (
-                            "openai"
-                            if "gpt" in custom.get("model", "gpt")
-                            else "google"
-                        ),
-                    }
-                )
-
-        return agents
+        """デフォルトエージェントとカスタムエージェントを結合して返す (Delegated to AgentRegistry)"""
+        return self.agent_registry.get_all_agents(db_session)
 
     def _get_agent_order(self, db_session: DbSession) -> List[str]:
-        """エージェントの発言順序を返す（有効なエージェントのみ）"""
-        all_order = ["01", "02", "03", "04", "05", "06"]
-
-        if db_session.custom_agents:
-            for idx, custom in enumerate(db_session.custom_agents):
-                # 永続化エージェントの場合はIDを保持
-                agent_id = custom.get("id", f"C{idx + 1:02d}")
-                all_order.append(agent_id)
-
-        # enabled_agent_idsが指定されている場合、フィルタリング
-        if db_session.enabled_agent_ids:
-            # 司会（01）は常に含める
-            enabled = list(db_session.enabled_agent_ids)
-            if "01" not in enabled:
-                enabled = ["01"] + enabled
-            return [agent_id for agent_id in all_order if agent_id in enabled]
-
-        return all_order
+        """エージェントの発言順序を返す (Delegated to AgentRegistry)"""
+        return self.agent_registry.get_agent_order(db_session)
 
     def _get_next_agent_id(self, current_agent_id: str, agent_order: List[str]) -> str:
-        """次の発言者IDを取得（ローテーション）"""
-        try:
-            current_index = agent_order.index(current_agent_id)
-            next_index = (current_index + 1) % len(agent_order)
-            return agent_order[next_index]
-        except ValueError:
-            return "01"  # 不明な場合は司会にフォールバック
+        """次の発言者IDを取得 (Delegated to AgentRegistry)"""
+        return self.agent_registry.get_next_agent_id(current_agent_id, agent_order)
 
     def _build_system_prompt(
         self,
@@ -71,64 +34,16 @@ class Orchestrator:
         agent_order: List[str],
         current_agent_id: str,
         all_agents: List[dict] = None,
+        db: Session = None,
     ) -> str:
-        """エージェント用のシステムプロンプトを生成"""
-        # エージェント名と役割のリストを作成
-        if all_agents:
-            order_names = []
-            for agent_id in agent_order:
-                agent = next((a for a in all_agents if a["id"] == agent_id), None)
-                if agent:
-                    order_names.append(f"{agent['name']}({agent['role']})")
-            order_str = " → ".join(order_names)
-        else:
-            order_str = " → ".join(agent_order)
-
-        # 司会かどうかで異なる指示
-        is_facilitator = current_agent_id == "01"
-
-        role_instruction = """
-【重要なルール】
-- 自分の役割と性格に徹してください
-
-
-【議論スタイル - 重要】
-- 他の参加者の意見に対して、遠慮なく反論・批判してください
-- 「それは違う」「○○の意見には反対だ」「その考えは甘い」「現実的ではない」などの表現を積極的に使ってください
-- 議論が白熱することは大歓迎です。馴れ合いや同調は避けてください
-- 具体的な理由を添えて、なぜ反対なのかを明確に述べてください
-- 意見やアイデアに対する建設的な批判を心がけてください
-- 自分の意見には自信を持ち、簡単には折れないでください
-"""
-
-        if is_facilitator:
-            role_instruction += """
-- あなたは司会として議論をまとめる権限があります
-- 対立する意見があれば、それぞれの立場を整理してください
-- 議論が白熱している場合は無理に止めず、建設的な方向に導いてください
-"""
-        else:
-            role_instruction += """
-- 議論のまとめや総括は行わないでください（それは司会の役割です）
-- 発言者の意見に対して、まず賛成か反対かを明確にしてから自分の意見を述べてください
-- 特に自分の専門領域に関する他者の発言には、厳しく評価してください
-"""
-
-        prompt = f"""あなたは「{agent_def['name']}」（{agent_def['role']}）です。
-
-【あなたの性格】: {agent_def['personality_key']}
-【あなたの責任】: {agent_def['responsibility']}
-
-【議論の発言順序】: {order_str}
-（この順序で自動的にローテーションします）
-
-{role_instruction}
-【議論の目的】
-ユーザーのトピックに対して、あなたの専門的視点から建設的だが遠慮のない意見を述べてください。
-他の参加者と意見が対立しても、自分の立場を明確に主張してください。
-発言は日本語で、簡潔かつ具体的に行ってください。"""
-
-        return prompt
+        """エージェント用のシステムプロンプトを生成 (Delegated to PromptBuilder)"""
+        return self.prompt_builder.build_system_prompt(
+            agent_def=agent_def,
+            agent_order=agent_order,
+            current_agent_id=current_agent_id,
+            all_agents=all_agents,
+            db=db,
+        )
 
     def _format_conversation_history(
         self, messages: List[DbMessage], all_agents: List[dict]
@@ -265,7 +180,7 @@ class Orchestrator:
 
         # 改善されたシステムプロンプトを生成
         system_prompt = self._build_system_prompt(
-            agent_def, agent_order, next_agent_id, all_agents
+            agent_def, agent_order, next_agent_id, all_agents, db
         )
 
         # 会話履歴を整形
